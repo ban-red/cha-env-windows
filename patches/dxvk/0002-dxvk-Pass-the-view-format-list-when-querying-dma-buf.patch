@@ -1,0 +1,42 @@
+From 88efecd8e4bf2a9f35dbc7e856c1d92eff5daea8 Mon Sep 17 00:00:00 2001
+From: Alex Red <235753003+ban-red@users.noreply.github.com>
+Date: Thu, 8 Oct 2026 20:32:31 -0600
+Subject: [PATCH 2/3] [dxvk] Pass the view format list when querying dma-buf
+ modifiers
+
+canShareDmabufImage asks vkGetPhysicalDeviceImageFormatProperties2
+whether each DRM format modifier supports the image, but for an image
+with VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT it leaves out the
+VkImageFormatListCreateInfo that allocateStorageWithUsage chains when
+it creates the image. The answer is then for an image that may be
+viewed in any compatible format, which a driver may refuse for
+modifiers it would accept for the real image.
+
+Chain the image's view format list into the query, as for creation.
+---
+ src/dxvk/dxvk_image.cpp | 12 ++++++++++++
+ 1 file changed, 12 insertions(+)
+
+diff --git a/src/dxvk/dxvk_image.cpp b/src/dxvk/dxvk_image.cpp
+index 7fd7de71..10e55bb5 100644
+--- a/src/dxvk/dxvk_image.cpp
++++ b/src/dxvk/dxvk_image.cpp
+@@ -864,6 +864,18 @@ namespace dxvk {
+       imageFormatInfo.usage = createInfo.usage;
+       imageFormatInfo.flags = createInfo.flags;
+ 
++      // A mutable image is created with its view formats listed
++      // (allocateStorageWithUsage); ask about that image. Without the
++      // list, the driver answers for an image that can take any
++      // compatible format.
++      VkImageFormatListCreateInfo formatList = { VK_STRUCTURE_TYPE_IMAGE_FORMAT_LIST_CREATE_INFO };
++
++      if ((createInfo.flags & VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT) && !m_viewFormats.empty()) {
++        formatList.viewFormatCount = m_viewFormats.size();
++        formatList.pViewFormats = m_viewFormats.data();
++        formatList.pNext = std::exchange(modifierInfo.pNext, &formatList);
++      }
++
+       VkExternalImageFormatProperties externalProperties = { VK_STRUCTURE_TYPE_EXTERNAL_IMAGE_FORMAT_PROPERTIES };
+       VkImageFormatProperties2 imageFormatProperties = { VK_STRUCTURE_TYPE_IMAGE_FORMAT_PROPERTIES_2, &externalProperties };
+ 

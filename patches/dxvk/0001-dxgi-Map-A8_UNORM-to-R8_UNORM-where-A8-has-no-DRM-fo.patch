@@ -1,0 +1,64 @@
+From c1b8646190d985bef81df7cf127dccb7869e9360 Mon Sep 17 00:00:00 2001
+From: Alex Red <235753003+ban-red@users.noreply.github.com>
+Date: Thu, 8 Oct 2026 20:32:31 -0600
+Subject: [PATCH 1/3] [dxgi] Map A8_UNORM to R8_UNORM where A8 has no DRM
+ format modifiers
+
+A D3D11 texture shared as a dma-buf needs a DRM format modifier. The
+NVIDIA driver (595.71, RTX 4090) reports no modifiers for
+VK_FORMAT_A8_UNORM but several for VK_FORMAT_R8_UNORM, which has the
+same layout, so every shared A8 texture failed with "no usable
+modifier for format VK_FORMAT_A8_UNORM". Windows' compositor creates
+such textures as soon as a paravirtual display driver starts.
+
+DXVK already maps DXGI_FORMAT_A8_UNORM to R8_UNORM with an
+(0, 0, 0, R) swizzle where A8 lacks the needed format features. Do the
+same where the device supports VK_EXT_image_drm_format_modifier and
+offers modifiers for R8_UNORM but none for A8_UNORM.
+---
+ src/dxgi/dxgi_format.cpp | 25 ++++++++++++++++++++++++-
+ 1 file changed, 24 insertions(+), 1 deletion(-)
+
+diff --git a/src/dxgi/dxgi_format.cpp b/src/dxgi/dxgi_format.cpp
+index 527c1d7e..169810d4 100644
+--- a/src/dxgi/dxgi_format.cpp
++++ b/src/dxgi/dxgi_format.cpp
+@@ -857,6 +857,21 @@ namespace dxvk {
+   }};
+   
+   
++  // How many DRM format modifiers the device offers for a format: images
++  // shared as dma-bufs need one. 0 without VK_EXT_image_drm_format_modifier.
++  static uint32_t CountDrmFormatModifiers(const Rc<DxvkDevice>& device, VkFormat format) {
++    if (!device->features().extImageDrmFormatModifier)
++      return 0u;
++
++    VkDrmFormatModifierPropertiesListEXT modifiers = { VK_STRUCTURE_TYPE_DRM_FORMAT_MODIFIER_PROPERTIES_LIST_EXT };
++    VkFormatProperties2 properties = { VK_STRUCTURE_TYPE_FORMAT_PROPERTIES_2, &modifiers };
++
++    device->adapter()->vki()->vkGetPhysicalDeviceFormatProperties2(
++      device->adapter()->handle(), format, &properties);
++    return modifiers.drmFormatModifierCount;
++  }
++
++
+   DXGIVkFormatTable::DXGIVkFormatTable(const Rc<DxvkDevice>& device)
+   : m_dxgiFormats (g_dxgiFormats), m_dxgiFamilies(g_dxgiFamilies) {
+     // AMD do not support 24-bit depth buffers on Vulkan,
+@@ -871,7 +886,15 @@ namespace dxvk {
+       RemapDepthFormat(DXGI_FORMAT_D24_UNORM_S8_UINT,     VK_FORMAT_D32_SFLOAT_S8_UINT);
+     }
+ 
+-    if (!CheckImageFormatSupport(device, VK_FORMAT_A8_UNORM_KHR,
++    // A8 surfaces shared as dma-bufs need a DRM format modifier. NVIDIA's
++    // driver (595) offers none for A8_UNORM, while it offers several for
++    // R8_UNORM, which has the same layout; the swizzle below keeps A8's
++    // meaning, as it does where A8 isn't supported at all.
++    bool a8LacksModifiers = device->features().extImageDrmFormatModifier
++      && !CountDrmFormatModifiers(device, VK_FORMAT_A8_UNORM_KHR)
++      && CountDrmFormatModifiers(device, VK_FORMAT_R8_UNORM);
++
++    if (a8LacksModifiers || !CheckImageFormatSupport(device, VK_FORMAT_A8_UNORM_KHR,
+           VK_FORMAT_FEATURE_2_SAMPLED_IMAGE_BIT |
+           VK_FORMAT_FEATURE_2_STORAGE_IMAGE_BIT |
+           VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT)) {

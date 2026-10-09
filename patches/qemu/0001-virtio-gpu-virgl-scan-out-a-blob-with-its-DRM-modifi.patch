@@ -1,0 +1,98 @@
+From 947b3db35d52112c7f800ada7595a5d01819d661 Mon Sep 17 00:00:00 2001
+From: Alex Red <235753003+ban-red@users.noreply.github.com>
+Date: Thu, 8 Oct 2026 20:33:16 -0600
+Subject: [PATCH 1/2] virtio-gpu-virgl: scan out a blob with its DRM modifier
+
+virtio_gpu_create_dmabuf describes every blob scanout's dma-buf as
+linear (modifier 0). A blob exported by a render-server context can be
+tiled -- an NVIDIA GPU renders only to tiled layouts -- and EGL then
+imports it with the wrong layout: the display shows black or garbage.
+
+At blob creation, ask virglrenderer for the modifier through its export
+query (VIRGL_RENDERER_STRUCTURE_TYPE_EXPORT_QUERY), keep it on the
+resource, and pass it to qemu_dmabuf_new. A virglrenderer that doesn't
+know it answers DRM_FORMAT_MOD_INVALID, which is kept as 0, the
+previous behaviour.
+---
+ hw/display/virtio-gpu-udmabuf.c |  3 ++-
+ hw/display/virtio-gpu-virgl.c   | 25 +++++++++++++++++++++++++
+ include/hw/virtio/virtio-gpu.h  |  2 ++
+ 3 files changed, 29 insertions(+), 1 deletion(-)
+
+diff --git a/hw/display/virtio-gpu-udmabuf.c b/hw/display/virtio-gpu-udmabuf.c
+index b4724da..da65511 100644
+--- a/hw/display/virtio-gpu-udmabuf.c
++++ b/hw/display/virtio-gpu-udmabuf.c
+@@ -186,7 +186,8 @@ static VGPUDMABuf
+     dmabuf->buf = qemu_dmabuf_new(r->width, r->height, fb->stride,
+                                   r->x, r->y, fb->width, fb->height,
+                                   qemu_pixman_to_drm_format(fb->format),
+-                                  0, res->dmabuf_fd, true, false);
++                                  res->dmabuf_modifier, res->dmabuf_fd,
++                                  true, false);
+     dmabuf->scanout_id = scanout_id;
+     /* Remember the request identity so a later identical present can reuse
+      * this dmabuf + its EGL import instead of re-creating it. */
+diff --git a/hw/display/virtio-gpu-virgl.c b/hw/display/virtio-gpu-virgl.c
+index b466693..ca3ec7f 100644
+--- a/hw/display/virtio-gpu-virgl.c
++++ b/hw/display/virtio-gpu-virgl.c
+@@ -19,6 +19,7 @@
+ #include "hw/virtio/virtio-gpu.h"
+ #include "hw/virtio/virtio-gpu-bswap.h"
+ #include "hw/virtio/virtio-gpu-pixman.h"
++#include "standard-headers/drm/drm_fourcc.h"
+ 
+ #include "ui/egl-helpers.h"
+ 
+@@ -931,6 +932,29 @@ static void virgl_cmd_get_capset(VirtIOGPU *g,
+ }
+ 
+ #if VIRGL_VERSION_MAJOR >= 1
++/*
++ * The DRM format modifier of a blob's dmabuf, or 0 (linear, or unknown).
++ * A render-server context (Neptune) can export tiled buffers -- NVIDIA
++ * can't render to linear ones -- and a scanout that imports one as
++ * linear shows garbage.  virglrenderer answers from what the exporter
++ * reported; an older one, or a blob nobody described, says INVALID.
++ */
++static uint64_t virgl_blob_modifier(uint32_t resource_id)
++{
++    struct virgl_renderer_export_query query = {
++        .hdr.stype = VIRGL_RENDERER_STRUCTURE_TYPE_EXPORT_QUERY,
++        .hdr.size = sizeof(query),
++        .in_resource_id = resource_id,
++        .in_export_fds = 0,
++    };
++
++    if (virgl_renderer_execute(&query, sizeof(query)) != 0 ||
++        query.out_modifier == DRM_FORMAT_MOD_INVALID) {
++        return 0;
++    }
++    return query.out_modifier;
++}
++
+ static void virgl_cmd_resource_create_blob(VirtIOGPU *g,
+                                            struct virtio_gpu_ctrl_command *cmd,
+                                            bool *cmd_suspended)
+@@ -1016,6 +1040,7 @@ static void virgl_cmd_resource_create_blob(VirtIOGPU *g,
+     }
+ 
+     res->base.dmabuf_fd = info.fd;
++    res->base.dmabuf_modifier = virgl_blob_modifier(cblob.resource_id);
+ 
+     /* Now live, cleaned up in virtio_gpu_virgl_resource_unref */
+     QTAILQ_INSERT_HEAD(&g->reslist, &res->base, next);
+diff --git a/include/hw/virtio/virtio-gpu.h b/include/hw/virtio/virtio-gpu.h
+index b103a56..3a1ff4e 100644
+--- a/include/hw/virtio/virtio-gpu.h
++++ b/include/hw/virtio/virtio-gpu.h
+@@ -58,6 +58,8 @@ struct virtio_gpu_simple_resource {
+     uint64_t blob_size;
+     void *blob;
+     int dmabuf_fd;
++    /* DRM format modifier of dmabuf_fd's layout; 0 if linear or unknown */
++    uint64_t dmabuf_modifier;
+     uint8_t *remapped;
+ 
+     QTAILQ_ENTRY(virtio_gpu_simple_resource) next;

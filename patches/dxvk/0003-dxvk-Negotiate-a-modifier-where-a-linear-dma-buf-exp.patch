@@ -1,0 +1,165 @@
+From 401c334cde1081d10916154beaea436f2dd68a43 Mon Sep 17 00:00:00 2001
+From: Alex Red <235753003+ban-red@users.noreply.github.com>
+Date: Thu, 8 Oct 2026 20:32:43 -0600
+Subject: [PATCH 3/3] [dxvk] Negotiate a modifier where a linear dma-buf export
+ can't render
+
+A texture created with DXVK_D3D11_RESOURCE_MISC_LINEAR_EXPORT may only
+use DRM_FORMAT_MOD_LINEAR. On NVIDIA the linear layout has no
+VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT, so a render target with that
+flag finds no modifier and creation fails. A paravirtual display
+driver sets the flag on Windows' scanout surfaces.
+
+When the linear-only search finds nothing, search again without the
+restriction and log once that a tiled modifier is used instead. The
+consumer must then import with the modifier, as QEMU's virtio-gpu
+dma-buf scanout does when it is given one.
+
+Most of the diff is the modifier loop moving into a lambda.
+---
+ src/dxvk/dxvk_image.cpp | 126 +++++++++++++++++++++++-----------------
+ 1 file changed, 72 insertions(+), 54 deletions(-)
+
+diff --git a/src/dxvk/dxvk_image.cpp b/src/dxvk/dxvk_image.cpp
+index 10e55bb5..42b9103b 100644
+--- a/src/dxvk/dxvk_image.cpp
++++ b/src/dxvk/dxvk_image.cpp
+@@ -834,66 +834,84 @@ namespace dxvk {
+     if (createInfo.usage & VK_IMAGE_USAGE_TRANSFER_DST_BIT)
+       requiredFormatFeatures |= VK_FORMAT_FEATURE_TRANSFER_DST_BIT;
+ 
+-    for (const auto& props : modifierProperties) {
+-      if ((props.drmFormatModifierTilingFeatures & requiredFormatFeatures) != requiredFormatFeatures)
+-        continue;
++    auto collectModifiers = [&] (bool linearOnly) {
++      for (const auto& props : modifierProperties) {
++        if ((props.drmFormatModifierTilingFeatures & requiredFormatFeatures) != requiredFormatFeatures)
++          continue;
++
++        if (sharingInfo.mode == DxvkSharedHandleMode::Import
++         && props.drmFormatModifier != sharingInfo.dmabufModifier)
++          continue;
++
++        // Linear-forced exports (scanout consumers without modifier
++        // plumbing) accept only DRM_FORMAT_MOD_LINEAR.
++        if (sharingInfo.mode == DxvkSharedHandleMode::Export
++         && linearOnly
++         && props.drmFormatModifier != 0u)
++          continue;
++
++        // Check whether images of this modifier support the parameters
++        VkPhysicalDeviceImageDrmFormatModifierInfoEXT modifierInfo = { VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_IMAGE_DRM_FORMAT_MODIFIER_INFO_EXT };
++        modifierInfo.drmFormatModifier = props.drmFormatModifier;
++        modifierInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
++
++        VkPhysicalDeviceExternalImageFormatInfo externalInfo = { VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTERNAL_IMAGE_FORMAT_INFO, &modifierInfo };
++        externalInfo.handleType = sharingInfo.type;
++
++        VkPhysicalDeviceImageFormatInfo2 imageFormatInfo = { VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_IMAGE_FORMAT_INFO_2, &externalInfo };
++        imageFormatInfo.format = createInfo.format;
++        imageFormatInfo.type = createInfo.imageType;
++        imageFormatInfo.tiling = VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT;
++        imageFormatInfo.usage = createInfo.usage;
++        imageFormatInfo.flags = createInfo.flags;
++
++        // A mutable image is created with its view formats listed
++        // (allocateStorageWithUsage); ask about that image. Without the
++        // list, the driver answers for an image that can take any
++        // compatible format.
++        VkImageFormatListCreateInfo formatList = { VK_STRUCTURE_TYPE_IMAGE_FORMAT_LIST_CREATE_INFO };
++
++        if ((createInfo.flags & VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT) && !m_viewFormats.empty()) {
++          formatList.viewFormatCount = m_viewFormats.size();
++          formatList.pViewFormats = m_viewFormats.data();
++          formatList.pNext = std::exchange(modifierInfo.pNext, &formatList);
++        }
+ 
+-      if (sharingInfo.mode == DxvkSharedHandleMode::Import
+-       && props.drmFormatModifier != sharingInfo.dmabufModifier)
+-        continue;
+-
+-      // Linear-forced exports (scanout consumers without modifier
+-      // plumbing) accept only DRM_FORMAT_MOD_LINEAR.
+-      if (sharingInfo.mode == DxvkSharedHandleMode::Export
+-       && sharingInfo.dmabufForceLinear
+-       && props.drmFormatModifier != 0u)
+-        continue;
+-
+-      // Check whether images of this modifier support the parameters
+-      VkPhysicalDeviceImageDrmFormatModifierInfoEXT modifierInfo = { VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_IMAGE_DRM_FORMAT_MODIFIER_INFO_EXT };
+-      modifierInfo.drmFormatModifier = props.drmFormatModifier;
+-      modifierInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+-
+-      VkPhysicalDeviceExternalImageFormatInfo externalInfo = { VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTERNAL_IMAGE_FORMAT_INFO, &modifierInfo };
+-      externalInfo.handleType = sharingInfo.type;
+-
+-      VkPhysicalDeviceImageFormatInfo2 imageFormatInfo = { VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_IMAGE_FORMAT_INFO_2, &externalInfo };
+-      imageFormatInfo.format = createInfo.format;
+-      imageFormatInfo.type = createInfo.imageType;
+-      imageFormatInfo.tiling = VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT;
+-      imageFormatInfo.usage = createInfo.usage;
+-      imageFormatInfo.flags = createInfo.flags;
+-
+-      // A mutable image is created with its view formats listed
+-      // (allocateStorageWithUsage); ask about that image. Without the
+-      // list, the driver answers for an image that can take any
+-      // compatible format.
+-      VkImageFormatListCreateInfo formatList = { VK_STRUCTURE_TYPE_IMAGE_FORMAT_LIST_CREATE_INFO };
+-
+-      if ((createInfo.flags & VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT) && !m_viewFormats.empty()) {
+-        formatList.viewFormatCount = m_viewFormats.size();
+-        formatList.pViewFormats = m_viewFormats.data();
+-        formatList.pNext = std::exchange(modifierInfo.pNext, &formatList);
+-      }
++        VkExternalImageFormatProperties externalProperties = { VK_STRUCTURE_TYPE_EXTERNAL_IMAGE_FORMAT_PROPERTIES };
++        VkImageFormatProperties2 imageFormatProperties = { VK_STRUCTURE_TYPE_IMAGE_FORMAT_PROPERTIES_2, &externalProperties };
+ 
+-      VkExternalImageFormatProperties externalProperties = { VK_STRUCTURE_TYPE_EXTERNAL_IMAGE_FORMAT_PROPERTIES };
+-      VkImageFormatProperties2 imageFormatProperties = { VK_STRUCTURE_TYPE_IMAGE_FORMAT_PROPERTIES_2, &externalProperties };
++        if (vki->vkGetPhysicalDeviceImageFormatProperties2(device->adapter()->handle(),
++            &imageFormatInfo, &imageFormatProperties) != VK_SUCCESS)
++          continue;
++
++        const auto& limits = imageFormatProperties.imageFormatProperties;
++
++        if ((externalProperties.externalMemoryProperties.externalMemoryFeatures & requiredFeatures) != requiredFeatures
++         || createInfo.extent.width > limits.maxExtent.width
++         || createInfo.extent.height > limits.maxExtent.height
++         || createInfo.extent.depth > limits.maxExtent.depth
++         || createInfo.mipLevels > limits.maxMipLevels
++         || createInfo.arrayLayers > limits.maxArrayLayers)
++          continue;
++
++        m_dmabufModifiers.push_back({ props.drmFormatModifier, props.drmFormatModifierPlaneCount });
++      }
++    };
+ 
+-      if (vki->vkGetPhysicalDeviceImageFormatProperties2(device->adapter()->handle(),
+-          &imageFormatInfo, &imageFormatProperties) != VK_SUCCESS)
+-        continue;
++    collectModifiers(sharingInfo.dmabufForceLinear);
+ 
+-      const auto& limits = imageFormatProperties.imageFormatProperties;
++    // A linear export is what a guest asks of its scanout surfaces, for
++    // consumers without modifier support. NVIDIA can't render to linear
++    // images, so none fits there; negotiate a modifier instead, which a
++    // modifier-aware consumer (QEMU's dma-buf scanout) imports.
++    if (m_dmabufModifiers.empty() && sharingInfo.mode == DxvkSharedHandleMode::Export
++     && sharingInfo.dmabufForceLinear) {
++      static std::atomic<bool> s_warned = { false };
+ 
+-      if ((externalProperties.externalMemoryProperties.externalMemoryFeatures & requiredFeatures) != requiredFeatures
+-       || createInfo.extent.width > limits.maxExtent.width
+-       || createInfo.extent.height > limits.maxExtent.height
+-       || createInfo.extent.depth > limits.maxExtent.depth
+-       || createInfo.mipLevels > limits.maxMipLevels
+-       || createInfo.arrayLayers > limits.maxArrayLayers)
+-        continue;
++      if (!s_warned.exchange(true))
++        Logger::warn("dmabuf: linear export can't be used for this image on this device; negotiating a modifier");
+ 
+-      m_dmabufModifiers.push_back({ props.drmFormatModifier, props.drmFormatModifierPlaneCount });
++      collectModifiers(false);
+     }
+ 
+     if (m_dmabufModifiers.empty()) {

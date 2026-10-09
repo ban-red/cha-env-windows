@@ -1,0 +1,21 @@
+{
+  "version": 1,
+  "id": "windows",
+  "name": "Windows (experimental)",
+  "templates": [
+    {
+      "id": "win11",
+      "name": "Windows 11 (experimental)",
+      "description": "Windows 11 in a VM with GPU-accelerated D3D11 (Neptune), no GPU passthrough. The first launch installs Windows from an ISO in the shared folder, about 20 minutes. Bring your own licence.",
+      "image": "ghcr.io/ban-red/cha-env-windows:{version}",
+      "class": "desktop",
+      "security": "vm",
+      "shmMb": 256,
+      "persistent": true,
+      "needsGpu": true,
+      "shared": {
+        "access": "read"
+      }
+    }
+  ]
+}

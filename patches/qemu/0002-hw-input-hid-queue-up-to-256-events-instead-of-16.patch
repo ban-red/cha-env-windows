@@ -1,0 +1,40 @@
+From 14f37c25d08fd459623c327b3139158a7fde887b Mon Sep 17 00:00:00 2001
+From: Alex Red <235753003+ban-red@users.noreply.github.com>
+Date: Thu, 8 Oct 2026 20:33:16 -0600
+Subject: [PATCH 2/2] hw/input/hid: queue up to 256 events instead of 16
+
+hid_keyboard_event drops an event when the queue is full, and the guest
+drains it one event per USB poll. Input from a remote viewer can arrive
+in bursts (network jitter, a paste typed as keystrokes); with 16 slots
+a burst overflows, and when the dropped event is a key release the
+guest auto-repeats that key until it is pressed again.
+
+Raise QUEUE_LENGTH to 256: a burst is then delayed by a few polls
+rather than lost. The pointer queue shares the constant; its motion is
+already merged into the previous event, so it only fills with button
+changes, which it now keeps instead of dropping. This changes the size
+of the arrays in the migration stream.
+---
+ include/hw/input/hid.h | 9 ++++++++-
+ 1 file changed, 8 insertions(+), 1 deletion(-)
+
+diff --git a/include/hw/input/hid.h b/include/hw/input/hid.h
+index 6a9d7bf..2f4587b 100644
+--- a/include/hw/input/hid.h
++++ b/include/hw/input/hid.h
+@@ -12,7 +12,14 @@ typedef struct HIDPointerEvent {
+     int32_t dz, buttons_state;
+ } HIDPointerEvent;
+ 
+-#define QUEUE_LENGTH    16 /* should be enough for a triple-click */
++/*
++ * Enough for a burst of keystrokes: a remote viewer's input can arrive in
++ * clumps (network jitter), and the guest drains one event per USB poll.
++ * A full queue drops events, a lost key-up leaves the key held and the
++ * guest repeating it.  Must stay a power of two (QUEUE_MASK).  Changes the
++ * migration stream's array sizes.
++ */
++#define QUEUE_LENGTH    256
+ #define QUEUE_MASK      (QUEUE_LENGTH-1u)
+ #define QUEUE_INCR(v)   ((v)++, (v) &= QUEUE_MASK)
+ 

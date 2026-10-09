@@ -1,0 +1,507 @@
+#!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-2.0-or-later
+"""Windows 11 in QEMU/KVM, as a Cha Portal app.
+
+The first launch installs Windows unattended from an ISO the owner provides
+(the template's shared directory, or CHA_WINDOWS_ISO), showing Windows Setup
+in the stream; every launch after boots the installed disk with Neptune 3D.
+Everything the VM keeps is in ~/windows, so it lasts while the user keeps
+their app data.
+
+  cha-windows          install if needed, then run
+  cha-windows doctor   check KVM, the render node, Vulkan and the stack
+"""
+
+from __future__ import annotations
+
+import glob
+import hashlib
+import json
+import os
+import shutil
+import signal
+import socket
+import subprocess
+import sys
+import tempfile
+import time
+import urllib.request
+from pathlib import Path
+from typing import NoReturn
+
+PREFIX = Path("/opt/neptune")
+QEMU = PREFIX / "bin/qemu-system-x86_64"
+QEMU_IMG = PREFIX / "bin/qemu-img"
+# Not the Secure Boot build: that one hangs at Windows' CD prompt without SMM and
+# secure flash. The answer file tells Setup to skip its Secure Boot check.
+OVMF_CODE = Path("/usr/share/OVMF/OVMF_CODE_4M.fd")
+OVMF_VARS = Path("/usr/share/OVMF/OVMF_VARS_4M.fd")
+UNATTEND = Path("/opt/cha-windows/unattend")
+
+# UTM's guest tools: the viogpu3d driver Neptune needs, and virtio drivers.
+GUEST_TOOLS_URL = (
+    "https://github.com/utmapp/qemu/releases/download/v10.0.12-utm/"
+    "utm-guest-tools-0.1.273.iso"
+)
+GUEST_TOOLS_SHA256 = "7d2c0343e92358ad5e65078b08ec1dad873eb91b3c154aef60531bf6c2f04601"
+
+HOME = Path(os.environ.get("HOME", "/home/cha"))
+STATE = Path(os.environ.get("CHA_WINDOWS_DIR", HOME / "windows"))
+RUN = Path(os.environ.get("XDG_RUNTIME_DIR", "/run/cha"))
+SCRATCH = Path(tempfile.mkdtemp(prefix="cha-windows-"))
+QMP = SCRATCH / "qmp.sock"
+TPM = SCRATCH / "swtpm.sock"
+
+# gtk: QEMU's window is the app, which Cha streams. headless: no window, for
+# checks on a node without a compositor; a screendump is written to
+# ~/windows/logs/screen.ppm every few seconds (not of the 3D display).
+DISPLAY = os.environ.get("CHA_WINDOWS_DISPLAY", "gtk")
+
+
+def log(message: str) -> None:
+    print(f"cha-windows: {message}", file=sys.stderr, flush=True)
+
+
+def status(label: str | None, **extra: object) -> None:
+    """The setup status the page shows over the picture; None clears it."""
+    if not RUN.is_dir():
+        return
+    body = {"label": label, **extra} if label else {}
+    temporary = RUN / "status.tmp"
+    try:
+        temporary.write_text(json.dumps(body))
+        temporary.replace(RUN / "status")
+    except OSError as error:
+        log(f"status not written: {error}")
+
+
+def fail(message: str) -> NoReturn:
+    log(message)
+    status(message)
+    # Leave the message on the page a moment before the environment ends.
+    time.sleep(5)
+    sys.exit(1)
+
+
+class State:
+    path = STATE / "state.json"
+
+    def __init__(self) -> None:
+        self.phase = "new"
+        self.detail = ""
+        if self.path.exists():
+            value = json.loads(self.path.read_text())
+            self.phase = value.get("phase", "new")
+            self.detail = value.get("detail", "")
+
+    def save(self, phase: str, detail: str = "") -> None:
+        self.phase, self.detail = phase, detail
+        temporary = self.path.with_suffix(".tmp")
+        temporary.write_text(json.dumps({"phase": phase, "detail": detail}) + "\n")
+        temporary.replace(self.path)
+
+
+# --- QMP --------------------------------------------------------------------
+
+
+def qmp(command: str, **arguments: object) -> dict:
+    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as connection:
+        connection.settimeout(5)
+        connection.connect(str(QMP))
+        stream = connection.makefile("rwb", buffering=0)
+        json.loads(stream.readline())
+        stream.write(b'{"execute":"qmp_capabilities"}\n')
+        json.loads(stream.readline())
+        request = {"execute": command}
+        if arguments:
+            request["arguments"] = arguments
+        stream.write(json.dumps(request).encode() + b"\n")
+        while True:
+            reply = json.loads(stream.readline())
+            if "return" in reply or "error" in reply:
+                return reply
+
+
+def wait_for(path: Path, process: subprocess.Popen, timeout: float = 30) -> None:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if path.exists():
+            return
+        if process.poll() is not None:
+            raise RuntimeError(
+                f"{process.args[0]} exited ({process.returncode}) before {path} appeared")
+        time.sleep(0.1)
+    raise TimeoutError(f"{path} did not appear within {timeout:.0f} s")
+
+
+# --- Devices and media -------------------------------------------------------
+
+
+def render_node() -> str | None:
+    nodes = sorted(glob.glob("/dev/dri/renderD*"))
+    return nodes[0] if nodes else None
+
+
+def check_devices() -> None:
+    if not os.access("/dev/kvm", os.R_OK | os.W_OK):
+        fail("No KVM: this node doesn't give the app /dev/kvm")
+    if render_node() is None:
+        fail("No GPU render node: Windows' 3D needs one")
+
+
+def find_iso() -> Path | None:
+    named = os.environ.get("CHA_WINDOWS_ISO")
+    if named:
+        return Path(named) if Path(named).is_file() else None
+    for directory in (os.environ.get("CHA_SHARED_DIR"), str(HOME)):
+        if not directory or not os.path.isdir(directory):
+            continue
+        isos = [p for p in Path(directory).iterdir() if p.suffix.lower() == ".iso" and p.is_file()]
+        # A name that says Windows over any other ISO lying there, then the
+        # newest: an owner adds a new release beside the old one.
+        isos.sort(key=lambda p: ("win" not in p.name.lower(), -p.stat().st_mtime))
+        if isos:
+            return isos[0]
+    return None
+
+
+def sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        for block in iter(lambda: stream.read(1 << 20), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def guest_tools() -> Path:
+    destination = STATE / "media/utm-guest-tools.iso"
+    if destination.exists() and sha256(destination) == GUEST_TOOLS_SHA256:
+        return destination
+    temporary = destination.with_suffix(".part")
+    log(f"downloading {GUEST_TOOLS_URL}")
+    with (urllib.request.urlopen(GUEST_TOOLS_URL, timeout=60) as response,
+          temporary.open("wb") as out):
+        total = int(response.headers.get("Content-Length") or 0)
+        done = 0
+        while block := response.read(1 << 20):
+            out.write(block)
+            done += len(block)
+            status("Downloading guest drivers", done=done >> 20, total=total >> 20, unit="MB")
+    if sha256(temporary) != GUEST_TOOLS_SHA256:
+        temporary.unlink()
+        fail("The guest drivers' download didn't match its checksum")
+    temporary.replace(destination)
+    return destination
+
+
+def seed_floppy() -> Path:
+    """The answer file and first-logon script, on a floppy Setup reads."""
+    seed = STATE / "media/unattend.img"
+    values = {
+        "@@EDITION@@": os.environ.get("CHA_WINDOWS_EDITION", "Windows 11 Pro"),
+        "@@USER@@": os.environ.get("CHA_WINDOWS_USER", "cha"),
+        "@@PASSWORD@@": os.environ.get("CHA_WINDOWS_PASSWORD", "cha"),
+        "@@LOCALE@@": os.environ.get("CHA_WINDOWS_LOCALE", "en-US"),
+        "@@TIMEZONE@@": os.environ.get("CHA_WINDOWS_TIMEZONE", "UTC"),
+    }
+    with tempfile.TemporaryDirectory() as directory:
+        staging = Path(directory)
+        for name in ("Autounattend.xml", "firstlogon.ps1"):
+            text = (UNATTEND / name).read_text()
+            for marker, value in values.items():
+                text = text.replace(marker, value)
+            (staging / name).write_text(text)
+        seed.unlink(missing_ok=True)
+        with seed.open("wb") as image:
+            image.truncate(1440 * 1024)
+        subprocess.run(["mkfs.fat", "-F", "12", "-n", "CHA_SETUP", str(seed)], check=True,
+                       stdout=subprocess.DEVNULL)
+        subprocess.run(["mcopy", "-i", str(seed), str(staging / "Autounattend.xml"),
+                        str(staging / "firstlogon.ps1"), "::/"], check=True)
+    return seed
+
+
+def install_marker(seed: Path) -> str | None:
+    found = subprocess.run(["mtype", "-i", str(seed), "::/done.txt"],
+                           capture_output=True, text=True)
+    return found.stdout.strip() if found.returncode == 0 else None
+
+
+# --- QEMU ---------------------------------------------------------------------
+
+
+def start_tpm() -> subprocess.Popen:
+    (STATE / "tpm").mkdir(exist_ok=True)
+    process = subprocess.Popen(
+        ["swtpm", "socket", "--tpm2", "--tpmstate", f"dir={STATE / 'tpm'}",
+         "--ctrl", f"type=unixio,path={TPM},terminate",
+         "--flags", "not-need-init,startup-clear"],
+        stdout=open(STATE / "logs/swtpm.log", "ab"), stderr=subprocess.STDOUT)
+    wait_for(TPM, process)
+    return process
+
+
+def machine() -> list[str]:
+    cpus = os.environ.get("CHA_WINDOWS_CPUS") or str(max(2, (os.cpu_count() or 4) // 2))
+    memory = os.environ.get("CHA_WINDOWS_RAM", "8G")
+    pulse = os.environ.get("PULSE_SERVER", "unix:/run/cha/pulse/native").removeprefix("unix:")
+    # off: a blob unmap zaps only its own memslot, not the guest's whole
+    # memory (hundreds of ms per D3D teardown otherwise). Needs Linux 6.13+.
+    accel = "kvm"
+    if os.environ.get("CHA_WINDOWS_SLOT_ZAP_ALL") == "off":
+        accel += ",slot-zap-all=off"
+    # QEMU won't start on a sound server that isn't there (checks off Cha).
+    audio = f"pa,id=sound,server={pulse}" if Path(pulse).is_socket() else "none,id=sound"
+    return [
+        str(QEMU), "-name", "Windows",
+        "-machine", "q35", "-accel", accel, "-cpu", "host,hv-passthrough",
+        "-smp", cpus, "-m", memory,
+        "-drive", f"if=pflash,format=raw,readonly=on,file={OVMF_CODE}",
+        "-drive", f"if=pflash,format=raw,file={STATE / 'OVMF_VARS.fd'}",
+        "-chardev", f"socket,id=tpm,path={TPM}",
+        "-tpmdev", "emulator,id=tpm0,chardev=tpm", "-device", "tpm-tis,tpmdev=tpm0",
+        # cache=none: the guest's writes bypass the host's page cache, so an
+        # install's burst of writes can't crowd out the node's memory.
+        # aio=threads: Docker's seccomp profile refuses io_uring.
+        "-drive", f"if=none,id=disk,format=qcow2,file={STATE / 'windows.qcow2'},"
+                  "discard=unmap,cache=none,aio=threads",
+        "-device", "nvme,drive=disk,serial=CHAWINDOWS",
+        "-device", "qemu-xhci,id=xhci",
+        "-device", "usb-kbd,bus=xhci.0", "-device", "usb-tablet,bus=xhci.0",
+        "-netdev", "user,id=net", "-device", "e1000e,netdev=net",
+        "-audiodev", audio,
+        "-device", "ich9-intel-hda", "-device", "hda-output,audiodev=sound",
+        "-rtc", "base=localtime",
+        "-monitor", "none", "-qmp", f"unix:{QMP},server=on,wait=off",
+        # A bugcheck reaches QEMU through Hyper-V's crash registers. QEMU's
+        # default is to shut down, exit 0, as if Windows had been stopped;
+        # fail instead, and log the stop code (guest_errors) for crash_report.
+        "-action", "panic=exit-failure", "-d", "guest_errors",
+    ]
+
+
+def display(accelerated: bool) -> list[str]:
+    width = os.environ.get("CHA_WIDTH", "1920")
+    height = os.environ.get("CHA_HEIGHT", "1080")
+    size = f"xres={width},yres={height}"
+    if accelerated:
+        gpu = ["-device", "virtio-vga-gl,blob=true,venus=on,neptune=true,hostmem=4G,"
+                          f"event_idx=on,{size}"]
+    else:
+        gpu = ["-device", f"virtio-vga,{size}"]
+    if DISPLAY == "headless":
+        if accelerated:
+            shown = ["-display", f"egl-headless,rendernode={render_node()}"]
+        else:
+            shown = ["-display", "none"]
+    else:
+        gl = "on" if accelerated else "off"
+        shown = ["-display", f"gtk,gl={gl},full-screen=on,show-menubar=off,show-tabs=off,"
+                             "zoom-to-fit=on"]
+    # For debugging: more QEMU arguments, split on spaces.
+    return gpu + shown + os.environ.get("CHA_WINDOWS_QEMU_ARGS", "").split()
+
+
+class Vm:
+    """QEMU and its TPM; a stop asks Windows to shut down first."""
+
+    def __init__(self, arguments: list[str]) -> None:
+        QMP.unlink(missing_ok=True)
+        self.tpm = start_tpm()
+        log("starting " + " ".join(arguments))
+        self.qemu = subprocess.Popen(arguments, stdout=open(STATE / "logs/qemu.log", "ab"),
+                                     stderr=subprocess.STDOUT)
+        wait_for(QMP, self.qemu)
+
+    def powerdown(self, grace: float) -> None:
+        if self.qemu.poll() is not None:
+            return
+        try:
+            qmp("system_powerdown")
+        except OSError:
+            pass
+        try:
+            self.qemu.wait(timeout=grace)
+        except subprocess.TimeoutExpired:
+            log(f"Windows didn't shut down within {grace:.0f} s; stopping QEMU")
+        self.close()
+
+    def close(self) -> None:
+        for process in (self.qemu, self.tpm):
+            if process.poll() is None:
+                process.terminate()
+                try:
+                    process.wait(timeout=10)
+                except subprocess.TimeoutExpired:
+                    process.kill()
+
+
+def on_stop(vm: Vm) -> None:
+    def handler(_signum: int, _frame: object) -> None:
+        # The node gives a vm app 90 s to stop; leave QEMU and swtpm the rest.
+        vm.powerdown(float(os.environ.get("CHA_WINDOWS_STOP_GRACE", "75")))
+        sys.exit(0)
+    signal.signal(signal.SIGTERM, handler)
+    signal.signal(signal.SIGINT, handler)
+
+
+def screendump_loop(vm: Vm, interval: float) -> None:
+    """Waits for QEMU to exit; when headless, writes a screendump now and then."""
+    shot = STATE / "logs/screen.ppm"
+    next_shot = 0.0
+    while vm.qemu.poll() is None:
+        if DISPLAY == "headless" and time.monotonic() >= next_shot:
+            try:
+                qmp("screendump", filename=str(shot))
+            except OSError as error:
+                log(f"screendump: {error}")
+            next_shot = time.monotonic() + interval
+        time.sleep(1)
+
+
+# --- Phases ---------------------------------------------------------------------
+
+
+def prepare_disk() -> None:
+    for directory in ("media", "logs"):
+        (STATE / directory).mkdir(parents=True, exist_ok=True)
+    if not (STATE / "windows.qcow2").exists():
+        size = os.environ.get("CHA_WINDOWS_DISK", "128G")
+        subprocess.run([str(QEMU_IMG), "create", "-f", "qcow2", str(STATE / "windows.qcow2"), size],
+                       check=True, stdout=subprocess.DEVNULL)
+    if not (STATE / "OVMF_VARS.fd").exists():
+        shutil.copyfile(OVMF_VARS, STATE / "OVMF_VARS.fd")
+
+
+def install(state: State) -> None:
+    iso = find_iso()
+    if iso is None:
+        fail("No Windows 11 ISO: put one in this app's shared folder")
+    # Stopped after Setup copied Windows to the disk: boot the disk, where Setup
+    # carries on. Stopped before: start over.
+    disk = STATE / "windows.qcow2"
+    resuming = state.phase == "installing" and disk.exists() and disk.stat().st_size > 1 << 30
+    if not resuming:
+        # A failed install starts over on a clean disk.
+        (STATE / "windows.qcow2").unlink(missing_ok=True)
+        (STATE / "OVMF_VARS.fd").unlink(missing_ok=True)
+        shutil.rmtree(STATE / "tpm", ignore_errors=True)
+        prepare_disk()
+        seed = seed_floppy()
+    else:
+        seed = STATE / "media/unattend.img"
+    tools = guest_tools()
+    state.save("installing", str(iso))
+    log(f"installing Windows from {iso}")
+    status("Installing Windows: it restarts a few times, about 20 minutes")
+    vm = Vm(machine() + display(accelerated=False) + [
+        "-drive", f"if=none,id=iso,format=raw,readonly=on,file={iso}",
+        "-device", "ide-cd,bus=ide.0,drive=iso,bootindex=1",
+        "-drive", f"if=none,id=tools,format=raw,readonly=on,file={tools}",
+        "-device", "ide-cd,bus=ide.1,drive=tools",
+        "-device", "isa-fdc,id=fdc", "-drive", f"if=none,id=seed,format=raw,file={seed}",
+        "-device", "floppy,drive=seed,bus=fdc.0",
+    ])
+    on_stop(vm)
+    if not resuming:
+        # "Press any key to boot from CD or DVD": it shows for 5 s, at a time
+        # that depends on the firmware and the ISO (past 30 s for a 9 GB
+        # one). Not space or Enter: 26H2's Setup has a focused Cancel button
+        # they would press. "x" is no shortcut there or in its quit dialog.
+        for _ in range(240):
+            time.sleep(0.5)
+            try:
+                qmp("send-key", keys=[{"type": "qcode", "data": "x"}])
+            except OSError:
+                pass
+    screendump_loop(vm, 30)
+    vm.close()
+    done = install_marker(seed)
+    if done is None:
+        state.save("failed", f"QEMU exited {vm.qemu.returncode} before Setup finished")
+        fail("Windows Setup stopped before it finished; the next launch starts over")
+    state.save("installed", done)
+    log(f"installed: {done}")
+
+
+def crash_report() -> str | None:
+    """The bugcheck QEMU logged, e.g. "0x7e (0xc0000005, ...)", if Windows crashed."""
+    try:
+        lines = (STATE / "logs/qemu.log").read_text(errors="replace").splitlines()
+    except OSError:
+        return None
+    for line in reversed(lines):
+        if line.startswith("HV crash parameters: ("):
+            code, *rest = line.split("(", 1)[1].rstrip(")").split()
+            return f"{code} ({', '.join(rest)})"
+    return None
+
+
+def virtio_input() -> list[str]:
+    """A keyboard and tablet beside the USB ones, and UTM's guest tools.
+
+    Once Windows has vioinput (firstlogon.ps1 installs it), the guest driver
+    activates these and QEMU sends input to them: no USB polling, so no
+    queue to overflow and less latency. Until then the USB pair does.
+    """
+    arguments = ["-device", "virtio-keyboard-pci", "-device", "virtio-tablet-pci"]
+    tools = STATE / "media/utm-guest-tools.iso"
+    if tools.exists():
+        arguments += ["-drive", f"if=none,id=tools,format=raw,readonly=on,file={tools}",
+                      "-device", "ide-cd,bus=ide.1,drive=tools"]
+    return arguments
+
+
+def run() -> int:
+    status("Starting Windows")
+    vm = Vm(machine() + display(accelerated=True) + virtio_input())
+    on_stop(vm)
+    time.sleep(3)
+    status(None)
+    screendump_loop(vm, 10)
+    vm.close()
+    log(f"QEMU exited {vm.qemu.returncode}")
+    crash = crash_report()
+    if vm.qemu.returncode and crash:
+        fail(f"Windows crashed: stop code {crash}")
+    return vm.qemu.returncode or 0
+
+
+def doctor() -> int:
+    checks = {
+        "KVM": os.access("/dev/kvm", os.R_OK | os.W_OK),
+        "render node": render_node() is not None,
+        "udmabuf": os.access("/dev/udmabuf", os.R_OK | os.W_OK),
+        "QEMU": QEMU.is_file(),
+        "virglrenderer": (PREFIX / "lib/libvirglrenderer.so").exists(),
+        "DXVK": (PREFIX / "lib/libdxvk_d3d11.so").exists(),
+        "OVMF": OVMF_CODE.is_file(),
+    }
+    for name, ok in checks.items():
+        print(f"{'ok  ' if ok else 'FAIL'} {name}")
+    vulkan = subprocess.run(["vulkaninfo", "--summary"], capture_output=True, text=True)
+    gpus = [line.split("=", 1)[1].strip()
+            for line in vulkan.stdout.splitlines() if "deviceName" in line]
+    print(f"{'ok  ' if gpus else 'FAIL'} Vulkan: {', '.join(gpus) or vulkan.stderr.strip()[:200]}")
+    version = subprocess.run([str(QEMU), "--version"], capture_output=True, text=True)
+    print(version.stdout.splitlines()[0])
+    return 0 if all(checks.values()) and gpus else 1
+
+
+def main() -> int:
+    if sys.argv[1:] == ["doctor"]:
+        return doctor()
+    check_devices()
+    try:
+        STATE.mkdir(parents=True, exist_ok=True)
+        prepare_disk()
+    except OSError as error:
+        fail(f"Can't write {STATE}: {error}")
+    state = State()
+    if state.phase != "installed":
+        install(state)
+    return run()
+
+
+if __name__ == "__main__":
+    sys.exit(main())
