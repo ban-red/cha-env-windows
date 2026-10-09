@@ -4,6 +4,10 @@ Windows 11 as an environment for [Cha Portal](https://github.com/ban-red/cha-por
 
 This is experimental. It has been tested on one node: an NVIDIA RTX 4090 running Windows 11 26H2. See [docs/testing.md](docs/testing.md) for what was tested and what was found.
 
+![Windows 11 in a Docker container, streamed to a browser through Cha](docs/screenshot.jpg)
+
+*Windows 11 in a Docker container, streamed to a browser through Cha.*
+
 ## What to expect
 
 - The first launch installs Windows unattended from an ISO you provide, in about 20 minutes. Later launches boot the installed disk in about a minute.
